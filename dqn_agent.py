@@ -60,6 +60,7 @@ class DQN(nn.Module):
         super().__init__()
         # TODO: Implement network architecture
         H, W, C = obs_shape
+        self.n_actions = n_actions # store number of actions for later use
 
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels=C, out_channels=32, kernel_size=8, stride=4),
@@ -176,18 +177,21 @@ def select_action(state: np.ndarray, net: DQN, step: int,
     """
     
     # TODO: Implement epsilon-greedy action selection
-    # Compute current epsilon (exploration rate) 
+    # Compute current epsilon (exploration rate) with exponential decay
     eps = eps_end + (eps_start - eps_end) * math.exp(-step / eps_decay)
 
-    # Decide whether to explore or exploit 
+    # Number of actions from the network (do not hardcode 4)
+    n_actions = net.n_actions
+
+    # Exploration vs exploitation
     if random.random() < eps:
         # Exploration: choose a random action
-        action = random.randrange(4)  # 4 possible actions (up, down, left, right)
+        action = random.randrange(n_actions)
     else:
-        # Exploitation: choose best action according to the network
-        state_t = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)  # Add batch dim
+        # Exploitation: choose the best action according to the network
+        state_t = torch.as_tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
         with torch.no_grad():
-            q_values = net(state_t)
+            q_values = net(state_t)            # shape: (1, n_actions)
             action = int(q_values.argmax(dim=1).item())
 
     return action
@@ -256,37 +260,49 @@ def optimise(memory: ReplayMemory, policy: DQN, target: DQN,
     
     # TODO: Implement DQN optimization step
     # Check if enough samples are available
+    # Not enough samples to form a batch
     if len(memory) < batch_size:
         return
 
-    # Sample batch from memory 
+    # Sample batch of transitions: (state, action, reward, next_state, done)
     states, actions, rewards, next_states, dones = memory.sample(batch_size)
 
-    # Convert to torch tensors 
     device = next(policy.parameters()).device
+
+    # Convert to torch tensors on the correct device
     states = torch.as_tensor(states, device=device, dtype=torch.float32)
     actions = torch.as_tensor(actions, device=device, dtype=torch.int64).unsqueeze(1)
     rewards = torch.as_tensor(rewards, device=device, dtype=torch.float32).unsqueeze(1)
     next_states = torch.as_tensor(next_states, device=device, dtype=torch.float32)
     dones = torch.as_tensor(dones, device=device, dtype=torch.float32).unsqueeze(1)
 
-    #  Compute current Q-values from policy network 
-    # policy(states) -> (batch_size, n_actions)
-    # gather Q-values corresponding to each taken action
-    q_values = policy(states).gather(1, actions)
+    # Current Q-values for the actions actually taken: Q_policy(s, a)
+    # policy(states): (B, n_actions) -> gather along action dimension
+    q_values = policy(states).gather(1, actions)  # shape: (B, 1)
 
-    #  Compute target Q-values using target network 
+    # Double DQN target computation
     with torch.no_grad():
-        next_q_values = target(next_states).max(1)[0].unsqueeze(1)
-        target_q_values = rewards + (1 - dones) * gamma * next_q_values
+        # 1) Use policy network to select best action at next state: a* = argmax_a Q_policy(s', a)
+        next_q_policy = policy(next_states)                          # (B, n_actions)
+        next_actions = next_q_policy.argmax(dim=1, keepdim=True)     # (B, 1)
 
-    # Compute loss (Mean Squared Error) 
+        # 2) Use target network to evaluate that action: Q_target(s', a*)
+        next_q_target = target(next_states)                          # (B, n_actions)
+        next_q_values = next_q_target.gather(1, next_actions)        # (B, 1)
+
+        # 3) Bellman target: r + (1 - done) * gamma * Q_target(s', a*)
+        target_q_values = rewards + (1.0 - dones) * gamma * next_q_values
+
+    # Mean Squared Error loss between current Q and target Q
     loss = nn.functional.mse_loss(q_values, target_q_values)
 
-    # Optimize the model 
+    # Optimize the policy network
     optimiser.zero_grad()
     loss.backward()
+
+    # Optional: gradient clipping to improve stability
     nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+
     optimiser.step()
 
     return loss.item()
